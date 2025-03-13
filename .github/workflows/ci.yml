@@ -1,116 +1,290 @@
-name: ECSA Website CI/CD Pipeline
+name: ECSA 2025 CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, development ]
+    branches: [ main, development, feature/** ]
   pull_request:
     branches: [ main, development ]
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: 'Deployment target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+          - demo
 
 env:
-  # Farbschema der ECSA Website
+  # ECSA 2025 Design System Tokens
   NEXT_PUBLIC_PRIMARY_COLOR: '#9EB953'  # R158 G185 B83
   NEXT_PUBLIC_DARK_COLOR: '#546A29'
   NEXT_PUBLIC_LIGHT_COLOR: '#D9E1C7'
   NEXT_PUBLIC_BG_COLOR: '#F0F5E5'
   NEXT_PUBLIC_TEXT_COLOR: '#4D5E45'
+  NEXT_PUBLIC_API_VERSION: 'v3'
+  NEXT_PUBLIC_FEATURES_ENABLED: 'ai-assessment,blockchain-verify,ar-showcase'
+
+permissions:
+  contents: read
+  packages: write
+  deployments: write
+  id-token: write
 
 jobs:
-  lint:
-    name: Qualitätsprüfung
+  security-scan:
+    name: Security Analysis
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: Node.js einrichten
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: 18
           cache: 'npm'
-      - name: Abhängigkeiten installieren
+      
+      - name: Install dependencies
         run: npm ci
-      - name: ESLint-Prüfung ausführen
+      
+      - name: Run SAST scan
+        uses: github/codeql-action/analyze@v2
+        with:
+          languages: javascript
+      
+      - name: Dependency vulnerability scan
+        run: npm audit --production
+
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Node.js with caching
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run ESLint
         run: npm run lint
-      - name: Typüberprüfung ausführen
+      
+      - name: Run TypeScript type checking
         run: npm run type-check
+      
+      - name: Run Prettier check
+        run: npx prettier --check "src/**/*.{js,jsx,ts,tsx}"
+      
+      - name: Check for duplicate dependencies
+        run: npx depcheck
 
   test:
-    name: Tests ausführen
+    name: Testing Suite
     runs-on: ubuntu-latest
-    needs: lint
+    needs: quality
     steps:
       - uses: actions/checkout@v3
-      - name: Node.js einrichten
+      
+      - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: 18
           cache: 'npm'
-      - name: Abhängigkeiten installieren
+      
+      - name: Install dependencies
         run: npm ci
-      - name: Unit-Tests ausführen
-        run: npm test
-      - name: Test-Abdeckung speichern
+      
+      - name: Run unit tests
+        run: npm test -- --coverage
+      
+      - name: Run integration tests
+        run: npm run test:integration
+      
+      - name: Run E2E tests
+        uses: cypress-io/github-action@v5
+        with:
+          browser: chrome
+          record: true
+          build: npm run build
+          start: npm start
+          wait-on: 'http://localhost:3000'
+      
+      - name: Upload test results
         uses: actions/upload-artifact@v3
         with:
-          name: coverage-report
-          path: coverage/
-  
+          name: test-results
+          path: |
+            coverage/
+            cypress/videos/
+            cypress/screenshots/
+
   build:
-    name: Build-Prozess
+    name: Build Artifacts
     runs-on: ubuntu-latest
     needs: test
+    outputs:
+      build_id: ${{ steps.build_step.outputs.build_id }}
     steps:
       - uses: actions/checkout@v3
-      - name: Node.js einrichten
+      
+      - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: 18
           cache: 'npm'
-      - name: Abhängigkeiten installieren
+      
+      - name: Install dependencies
         run: npm ci
-      - name: Website bauen
-        run: npm run build
-      - name: Build-Artefakte speichern
+      
+      - name: Generate build ID
+        id: build_step
+        run: echo "build_id=$(date +'%Y%m%d%H%M%S')-${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+      
+      - name: Build application
+        run: |
+          npm run build
+          echo "Build ID: ${{ steps.build_step.outputs.build_id }}" >> dist/BUILD_INFO
+          echo "Build Date: $(date)" >> dist/BUILD_INFO
+          echo "Git Commit: ${GITHUB_SHA}" >> dist/BUILD_INFO
+      
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v3
         with:
-          name: build-output
+          name: build-${{ steps.build_step.outputs.build_id }}
           path: dist/
-  
+      
+      - name: Generate container image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/gatoraku/ecsa-website:${{ steps.build_step.outputs.build_id }}
+            ghcr.io/gatoraku/ecsa-website:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
   deploy-staging:
-    name: Staging-Deployment
-    if: github.ref == 'refs/heads/development'
+    name: Staging Deployment
+    if: github.ref == 'refs/heads/development' || github.event.inputs.deploy_target == 'staging'
     runs-on: ubuntu-latest
     needs: build
     environment:
       name: staging
       url: https://staging.ecsa-certificates.eu
     steps:
-      - uses: actions/checkout@v3
-      - name: Build-Artefakte herunterladen
+      - name: Download build artifacts
         uses: actions/download-artifact@v3
         with:
-          name: build-output
+          name: build-${{ needs.build.outputs.build_id }}
           path: dist
-      - name: Auf Staging-Umgebung deployen
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/ecsa-deployment-role
+          aws-region: eu-central-1
+      
+      - name: Deploy to staging environment
         run: |
-          echo "Deploying to staging environment..."
-          # Hier würde der tatsächliche Deployment-Befehl stehen
+          echo "Deploying build ${{ needs.build.outputs.build_id }} to staging environment"
+          aws s3 sync dist/ s3://ecsa-staging-website/ --delete
+          aws cloudfront create-invalidation --distribution-id ${{ secrets.STAGING_CF_DISTRO_ID }} --paths "/*"
+      
+      - name: Run post-deployment tests
+        run: |
+          echo "Running smoke tests against staging environment"
+          curl -s https://staging.ecsa-certificates.eu/api/health | grep -q "ok"
+      
+      - name: Notify Slack on successful deployment
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "🚀 Successfully deployed to staging: ${{ needs.build.outputs.build_id }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🚀 *Staging Deployment Successful*\n\nBuild: `${{ needs.build.outputs.build_id }}`\nCommit: `${{ github.sha }}`\nURL: https://staging.ecsa-certificates.eu"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
   deploy-production:
-    name: Produktions-Deployment
-    if: github.ref == 'refs/heads/main'
+    name: Production Deployment
+    if: github.ref == 'refs/heads/main' || github.event.inputs.deploy_target == 'production'
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, deploy-staging]
     environment:
       name: production
       url: https://ecsa-certificates.eu
     steps:
-      - uses: actions/checkout@v3
-      - name: Build-Artefakte herunterladen
+      - name: Download build artifacts
         uses: actions/download-artifact@v3
         with:
-          name: build-output
+          name: build-${{ needs.build.outputs.build_id }}
           path: dist
-      - name: Auf GitHub Pages deployen
-        uses: peaceiris/actions-gh-pages@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./dist
+          role-to-assume: arn:aws:iam::123456789012:role/ecsa-production-role
+          aws-region: eu-central-1
+      
+      - name: Deploy to production
+        run: |
+          echo "Deploying build ${{ needs.build.outputs.build_id }} to production environment"
+          aws s3 sync dist/ s3://ecsa-production-website/ --delete
+          aws cloudfront create-invalidation --distribution-id ${{ secrets.PRODUCTION_CF_DISTRO_ID }} --paths "/*"
+      
+      - name: Create deployment tag
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `refs/tags/prod-${new Date().toISOString().replace(/:/g, '-')}`,
+              sha: context.sha
+            })
+      
+      - name: Run post-deployment health checks
+        run: |
+          echo "Running health checks against production environment"
+          curl -s https://ecsa-certificates.eu/api/health | grep -q "ok"
+          curl -s https://ecsa-certificates.eu/api/metrics/uptime | grep -q "uptime"
+      
+      - name: Notify Slack on successful deployment
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "🚀 Successfully deployed to production: ${{ needs.build.outputs.build_id }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🚀 *Production Deployment Successful*\n\nBuild: `${{ needs.build.outputs.build_id }}`\nCommit: `${{ github.sha }}`\nURL: https://ecsa-certificates.eu"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
