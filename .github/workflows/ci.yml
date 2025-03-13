@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: ECSA Website CI/CD Pipeline
 
 on:
   push:
@@ -22,6 +22,10 @@ jobs:
       run: npm run lint
     - name: Build
       run: npm run build
+      env:
+        NEXT_PUBLIC_PRIMARY_COLOR: '#9EB953'
+        NEXT_PUBLIC_LIGHT_COLOR: '#D9E1C7'
+        NEXT_PUBLIC_DARK_COLOR: '#546A29'
     - name: Test
       run: npm test
   
@@ -40,6 +44,10 @@ jobs:
       run: npm ci
     - name: Build
       run: npm run build
+      env:
+        NEXT_PUBLIC_PRIMARY_COLOR: '#9EB953'
+        NEXT_PUBLIC_LIGHT_COLOR: '#D9E1C7'
+        NEXT_PUBLIC_DARK_COLOR: '#546A29'
     - name: Deploy to GitHub Pages
       uses: peaceiris/actions-gh-pages@v3
       with:
